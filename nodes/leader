@@ -1,0 +1,211 @@
+#!/usr/bin/env python
+#The line above is important so that this file is interpreted with Python when running it.
+
+# Import of python modules.
+import math
+
+# import of relevant libraries.
+import rospy # module for ROS APIs
+from geometry_msgs.msg import Twist, PointStamped # message type for cmd_vel
+import tf
+import actionlib
+from coordinated_motion.msg import Waypoints, AllocateAction, AllocateGoal
+from coordinated_motion.srv import NewFollower, NewFollowerResponse
+
+# Constants.
+FREQUENCY = 10 #Hz.
+DEFAULT_START_TOPIC = 'start'
+WAYPOINTS_TOPIC = '/waypoints'
+LINEAR_VELOCITY = 0.2 # m/s
+ANGULAR_VELOCITY = math.pi/1 # rad/s
+DEFAULT_CMD_VEL_TOPIC = 'cmd_vel'
+
+class Leader():
+  def __init__(self, linear_velocity=LINEAR_VELOCITY, angular_velocity=ANGULAR_VELOCITY):
+    """Constructor."""
+    self.linear_velocity = linear_velocity # Constant linear velocity set.
+    self.angular_velocity = angular_velocity # Constant angular velocity set.
+    self.this_robot = rospy.get_namespace()
+    self.listener = tf.TransformListener()
+    self.followers = []
+    self.waypoints = None
+
+    # Setting up publishers/subscribers.
+    self._cmd_pub = rospy.Publisher(DEFAULT_CMD_VEL_TOPIC, Twist, queue_size=1)
+    self.__waypoints_sub = rospy.Subscriber(WAYPOINTS_TOPIC,
+                                            Waypoints,
+                                            self.handle_waypoints)
+
+  def lead(self):
+    s = rospy.Service('/new_follower', NewFollower, self.handle_new_follower)
+
+    rospy.spin()
+  
+  def get_waypoint_distance(self, follower, waypoint):
+    (x,y) = waypoint
+
+    world_waypoint = PointStamped()
+    world_waypoint.point.x = x
+    world_waypoint.point.y = y
+    world_waypoint.point.z = 0.0
+    world_waypoint.header.frame_id = 'world'
+    world_waypoint.header.stamp = rospy.Time(0)
+    robot_waypoint = self.listener.transformPoint(follower, world_waypoint)
+    return self.get_distance(0,0,robot_waypoint.point.x,robot_waypoint.point.y)
+
+  def get_distance(self, x1, y1, x2, y2):
+    """"Utility function for getting the distance between two points (x1,y1) and (x2,y2)."""
+    return abs(((x2 - x1)**2 + (y2 - y1)**2)**0.5)
+
+  def allocate(self):
+    # greedily allocate waypoints to nearest robot
+    allocations = {}
+
+    available_waypoints = {0,1,2}
+    for f in self.followers + [self.this_robot]:
+      nearest_waypoint = 0
+      nearest_waypoint_distance = float('inf')
+      for w in available_waypoints:
+        waypoint_distance = self.get_waypoint_distance(f, self.waypoints[w])
+        if waypoint_distance < nearest_waypoint_distance:
+          nearest_waypoint_distance = waypoint_distance
+          nearest_waypoint = w
+      available_waypoints.remove(nearest_waypoint)
+      allocations[f] = self.waypoints[nearest_waypoint]
+
+    print("Allocations:")
+    print(allocations)
+
+    # send action to each robot to move to the waypoint
+    for f, (x,y) in allocations.items():
+      goal = AllocateGoal()
+      goal.x = x
+      goal.y = y
+      if f == self.this_robot:
+        self.move(goal)
+      else: 
+        client = actionlib.SimpleActionClient(f+'allocate', AllocateAction)
+        client.wait_for_server()
+        client.send_goal(goal)
+        client.wait_for_result()
+
+    # reset state
+    self.waypoints = None
+
+  def handle_new_follower(self, req):
+    """Processing of odom message."""
+    bot_name = req.robot_name
+    if bot_name not in self.followers:
+      self.followers.append(bot_name)
+      print("added new follower " + bot_name)
+      return NewFollowerResponse(True)
+    return NewFollowerResponse(False)
+
+  def handle_waypoints(self, msg):
+    """Processing of odom message."""
+    if self.waypoints is None:
+      self.waypoints = [(msg.x1,msg.y1),(msg.x2,msg.y2),(msg.x3,msg.y3)]
+      self.allocate()
+
+  def move_forward(self, distance):
+    """Function to move_forward for a given distance."""
+    # Rate at which to operate the while loop.
+    rate = rospy.Rate(FREQUENCY)
+
+    # Setting velocities. 
+    twist_msg = Twist()
+    twist_msg.linear.x = self.linear_velocity
+    start_time = rospy.get_rostime()
+    duration = rospy.Duration(distance/twist_msg.linear.x)
+
+    # Loop.
+    while not rospy.is_shutdown():
+      # Check if traveled of given distance based on time.
+      if rospy.get_rostime() - start_time >= duration:
+        break
+
+      # Publish message.
+      self._cmd_pub.publish(twist_msg)
+
+      # Sleep to keep the set publishing frequency.
+      rate.sleep()
+
+    # Traveled the required distance, stop.
+    self.stop()
+    
+  def rotate_in_place(self, rotation_angle):
+    """
+    Rotate in place the robot of rotation_angle (rad) based on fixed velocity.
+    Assumption: Counterclockwise rotation.
+    """
+    twist_msg = Twist()
+    twist_msg.angular.z = self.angular_velocity
+    
+    duration = rotation_angle / twist_msg.angular.z
+    start_time = rospy.get_rostime()
+    rate = rospy.Rate(FREQUENCY)
+    while not rospy.is_shutdown():
+      # Check if done
+      if rospy.get_rostime() - start_time >= rospy.Duration(duration):
+        break
+          
+      # Publish message.
+      self._cmd_pub.publish(twist_msg)
+      
+      # Sleep to keep the set frequency.
+      rate.sleep()
+
+    # Rotated the required angle, stop.
+    self.stop()
+
+  def stop(self):
+    """Stop the robot."""
+    twist_msg = Twist()
+    self._cmd_pub.publish(twist_msg)
+
+  def move(self, goal):
+    # transform waypoint frame from world to robot
+    world_waypoint = PointStamped()
+    world_waypoint.point.x = goal.x
+    world_waypoint.point.y = goal.y
+    world_waypoint.point.z = 0.0
+    world_waypoint.header.frame_id = 'world'
+    world_waypoint.header.stamp = rospy.Time(0)
+    robot_waypoint = self.listener.transformPoint(self.this_robot, world_waypoint)
+    d = self.get_distance(0, 0, robot_waypoint.point.x, robot_waypoint.point.y)
+    a = self.point_to_angle(robot_waypoint.point.x, robot_waypoint.point.y)
+    self.rotate_in_place(a)
+    self.move_forward(d)
+    print(self.this_robot + " done moving")
+    
+  def get_distance(self, x1, y1, x2, y2):
+    """"Utility function for getting the distance between two points (x1,y1) and (x2,y2)."""
+    return abs(((x2 - x1)**2 + (y2 - y1)**2)**0.5)
+
+  def point_to_angle(self, x, y):
+    """Utility function for converting a point (x,y) into the a positive angle in radians between the positive x axis and the ray from (0,0) to (x,y)."""
+    a = math.atan2(y, x)
+    if a < 0:
+      a += 2*math.pi
+    return a
+    
+def main():
+  """Main function."""
+  # 1st. initialization of node.
+  rospy.init_node("leader")
+
+  # Sleep for a few seconds to wait for the registration.
+  rospy.sleep(2)
+
+  # Initialization of the class for the regular polygon motion.
+  ld = Leader()
+    
+  try:
+    ld.lead()
+
+  except rospy.ROSInterruptException:
+    rospy.logerr("ROS node interrupted.")
+
+if __name__ == "__main__":
+  """Run the main function."""
+  main()
